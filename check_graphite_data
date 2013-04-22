@@ -1,184 +1,196 @@
 #!/usr/bin/python
 
-import getopt
 import sys
+import argparse
 import urllib
-
-STATE_OK = 0
-STATE_WARNING = 1
-STATE_CRITICAL = 2
-STATE_UNKNOWN = 3
-STATE_DEPENDENT = 4
-
-def usage():
-    print 'Usage:'
-    print '\tcheck_graphite_data <options>'
-    print 'Options:'
-    print '\t-c <num> --crit=<num>\t\tCritical threshold'
-    print '\t-w <num> --warn=<num>\t\tWarning threshold'
-    print '\t-u <url> --url=<url>\t\tGraphite graph URL'
-    print '\t-r\t\t\t\tReverse - Alert when the value is UNDER warn/crit instead of OVER'
-    print '\t-s <secs> --seconds=<secs>\tAverage over the last N seconds of data'
-    print '\t--d1 <url> --d2 <url>\t\tDiff the latest values between two graphs'
-    print '\t-W --holt-winters\t\tPerform a Holt-Winters check'
-    print '\t-U --critupper\t\t\tUpper Holt-Winters band breach causes a crit,'
-    print '\t\t\t\t\t- breaching lower band causes a warn'
-    print '\t-L --critlower\t\t\tLower Holt-Winters band breach causes a crit,'
-    print '\t\t\t\t\t- breaching upper band causes a warn'
-    print '\t(If neither -U nor -L are given, we will always warn)'
+import traceback
 
 
-def pull_graphite_data(url):
-    """Pull down raw data from Graphite"""
-    # Make sure the url ends with '&rawData'
-    if not url.endswith('&rawData'):
-        url = url + '&rawData'
-    data = urllib.urlopen(url).read()
-    return data
+class Nagios:
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
+    DEPENDENT = 4
 
 
-def eval_graphite_data(data, seconds):
-    """Get the most recent correct value from the data"""
+class GraphiteGraphSource:
+    def __init__(self, url):
+        if not url.endswith('&rawData'):
+            url += '&rawData'
+        self.url = url
+        self._data = None
+        self._graphs = None
 
-    sample_period = int(data.split('|')[0].split(',')[-1])
-    all_data_points = data.split('|')[-1].split(',')
+    def fetch(self):
+        self._data = urllib.urlopen(self.url).read()
 
-    # Evaluate what graphite returned, should either be a float, or None
-    # First, if the number of seconds of data we want to examine is smaller or
-    # equals the graphite sample period, just grab the latest data point.
-    # If that data point is None, grab the one before it.
-    # If that is None too, return 0.0.
-    if seconds <= sample_period:
-        if eval(all_data_points[-1]):
-            data_value = float(all_data_points[-1])
-        elif eval(all_data_points[-2]):
-            data_value = float(all_data_points[-2])
+    @property
+    def data(self):
+        if self._data is None:
+            self.fetch()
+
+        return self._data
+
+    @property
+    def graphs(self):
+        if self._graphs is None:
+            self._graphs = map(GraphiteGraph.from_rawdata, self.data.split())
+
+        return self._graphs
+
+
+class GraphiteGraph:
+    def __init__(self, target, sample_period, data_points):
+        self.target = target
+        self.sample_period = sample_period
+        self.data_points = data_points
+
+    def latest_nonzero_value(self, seconds):
+        data_value = 0.0
+
+        if seconds <= self.sample_period:
+            for data_value in reversed(self.data_points):
+                if data_value:
+                    break
         else:
-            data_value = 0.0
-    else:
-    # Second, if we requested more than on graphite sample period, work out how
-    # many sample periods we wanted (python always rounds division *down*)
-        data_points = (seconds/sample_period)
-        data_set = [ float(x) for x in all_data_points[-data_points:]
-                     if eval(x) ]
-        if data_set:
-            data_value = float( sum(data_set) / len(data_set) )
-        else:
-            data_value = 0.0
-    return data_value
+            # if we requested more than on graphite sample period, work out how
+            # many sample periods we wanted (python always rounds division *down*)
+            num_data_points = (seconds/self.sample_period)
+            data_set = filter(None, self.data_points[-num_data_points:])
+            if data_set:
+                data_value = float(sum(data_set) / len(data_set))
+
+        return data_value
+
+    @classmethod
+    def from_rawdata(cls, raw_data):
+        target, rest = raw_data.split(',', 1)
+        time_info, rest = rest.split('|', 1)
+        _start, _end, sample_period = map(int, time_info.split(','))
+        data_points = list((float(x) if x != 'None' else None) for x in rest.split(','))
+
+        return cls(target, sample_period, data_points)
 
 
-def get_hw_value(url, seconds=0):
+def get_hw_value(graphs, seconds=0):
     """Get the Holt-Winters value from a Graphite graph"""
 
-    data = pull_graphite_data(url)
-    for line in data.split():
-        if line.startswith('holtWintersConfidenceUpper'):
-            graphite_upper = eval_graphite_data(line, seconds)
-        elif line.startswith('holtWintersConfidenceLower'):
-            graphite_lower = eval_graphite_data(line, seconds)
+    graphite_data = graphite_lower = graphite_upper = 0
+
+    for graph in graphs:
+        value = graph.latest_nonzero_value(seconds)
+
+        if graph.target.startswith('holtWintersConfidenceUpper'):
+            graphite_upper = value
+        elif graph.target.startswith('holtWintersConfidenceLower'):
+            graphite_lower = value
         else:
-            graphite_data = eval_graphite_data(line, seconds)
+            graphite_data = value
 
     return graphite_data, graphite_lower, graphite_upper
 
 
-def get_value(url, seconds=0):
-    """Get the value from a Graphite graph"""
+def check_hw_data(url, seconds, critupper = False, critlower = False, **kwds):
+    graphs = GraphiteGraphSource(url).graphs
+    current, lower, upper = get_hw_value(graphs, seconds)
+    print (
+        'Current value: %s, lower band: %s, upper band: %s' %
+        (current, lower, upper)
+    )
 
-    data = pull_graphite_data(url)
-    data_value = eval_graphite_data(data, seconds)
-    return data_value
+    if (current > upper):
+        if critupper:
+            return Nagios.CRITICAL
+        else:
+            return Nagios.WARNING
+    elif (current < lower):
+        if critlower:
+            return Nagios.CRITICAL
+        else:
+            return Nagios.WARNING
+
+    return Nagios.OK
+
+
+def check_diff_data(diff1, diff2, seconds, crit, warn, reverse = False, **kwds):
+    values = [GraphiteGraphSource(u).graphs[0].latest_nonzero_value(seconds) for u in (diff1, diff2)]
+    current = abs(values[0] - values[1])
+
+    return simple_graph_comparator(current, crit, warn, reverse)
+
+
+def check_single_data(url, seconds, crit, warn, reverse = False, **kwds):
+    value = GraphiteGraphSource(url).graphs[0].latest_nonzero_value(seconds)
+    return simple_graph_comparator(value, crit, warn, reverse)
+
+
+def simple_graph_comparator(current, crit, warn, reverse):
+    print (
+        'Current value: %s, warn threshold: %s, crit threshold: %s' %
+        (current, warn, crit)
+    )
+
+    sign = -1 if reverse else 1
+    if (sign * (current - crit)) >= 0:
+        return Nagios.CRITICAL
+    elif (sign * (current - warn)) >= 0:
+        return Nagios.WARNING
+    else:
+        return Nagios.OK
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("-W", "--holt-winters", dest = 'hw', action = 'store_true', help = 'Perform a Holt-Winters check')
+    parser.add_argument("-U", "--critupper", dest = 'critupper', action = 'store_true', help = 'Upper Holt-Winters band breach causes a crit, breaching lower band causes a warn')
+    parser.add_argument("-L", "--critlower", dest = 'critlower', action = 'store_true', help = 'Lower Holt-Winters band breach causes a crit, breaching upper band causes a warn')
+    parser.add_argument("-r", "--reverse", dest = 'reverse', default = False, action = 'store_true', help = 'Reverse - Alert when the value is UNDER warn/crit instead of OVER')
+    parser.add_argument('-u', '--url', dest = 'url', type = str, help = 'Graphite graph URL')
+    parser.add_argument('-c', '--crit', dest = 'crit', type = float, help = 'Critical threshold')
+    parser.add_argument('-w', '--warn', dest = 'warn', type = float, help = 'Warning threshold')
+    parser.add_argument("-s", "--seconds", dest = 'seconds', default = 0, type = int, help = 'Average over the last N seconds of data')
+    parser.add_argument("--d1", dest = 'diff1', type = str, help = 'Diff the latest values between two graphs (requires d2 be set')
+    parser.add_argument("--d2", dest = 'diff2', type = str, help = 'Diff the latest values between two graphs (requires d1 be set')
+    parser.add_argument("-T", "--test_threshold", default = None, type=float)
+
+    return parser
 
 
 def main(argv):
+    parser = build_parser()
+
+    def bail():
+        parser.print_help()
+        return Nagios.UNKNOWN
+
     try:
-        opts, args = getopt.getopt(argv, 'hWULru:c:w:s:',
-                                    ['help', 'holt-winters', 'critupper',
-                                     'critlower', 'url=', 'crit=', 'warn=',
-                                     'seconds=', 'd1=', 'd2='])
-    except getopt.GetoptError, err:
-        print str(err)
-        sys.exit(STATE_UNKNOWN)
+        args = parser.parse_args(argv)
+    except argparse.ArgumentError, e:
+        print str(e)
+        return bail()
 
-    url = None
-    warn = None
-    crit = None
-    seconds = 0
-    diff1 = None
-    diff2 = None
-    reverse = False
-    hw = None
-    critupper = None
-    critlower = None
-    for opt, arg in opts:
-        if opt in ('-h', '--help'):
-            usage()
-            sys.exit()
-        elif opt in ('-u', '--url'):
-            url = arg
-        elif opt in ('-w', '--warn'):
-            warn = float(arg)
-        elif opt in ('-c', '--crit'):
-            crit = float(arg)
-        elif opt in ('-s', '--seconds'):
-            seconds = int(arg)
-        elif opt in ('-r'):
-            reverse = True
-        elif opt in ('--d1'):
-            diff1 = arg
-        elif opt in ('--d2'):
-            diff2 = arg
-        elif opt in ('-W', '--holtwinters'):
-            hw = True
-        elif opt in ('-U', '--critupper'):
-            critupper = True
-        elif opt in ('-L', '--critlower'):
-            critlower = True
-    if not hw and ((url == None) or (warn == None) or (crit == None)) \
-            and not diff1 and not diff2:
-        usage()
-        sys.exit(STATE_UNKNOWN)
+    mode = None
+    if args.hw:
+        mode = check_hw_data
+    elif args.warn and args.crit:
+        if args.diff1 and args.diff2:
+            mode = check_diff_data
+        elif args.url:
+            mode = check_single_data
 
-    if (diff1 == None and diff2 != None) or (diff1 != None and diff2 == None):
-        usage()
-        sys.exit(STATE_UNKNOWN)
+    if mode is None:
+        return bail()
 
-    if hw:
-        graphite_data, graphite_lower, graphite_upper = get_hw_value(url, seconds)
-        print 'Current value: %s, lower band: %s, upper band: %s' % \
-               (graphite_data, graphite_lower, graphite_upper)
-        if (graphite_data > graphite_upper) or (graphite_data < graphite_lower):
-            if critupper or critlower:
-                sys.exit(STATE_CRITICAL)
-            else:
-                sys.exit(STATE_WARNING)
-        else:
-            sys.exit(STATE_OK)
-    elif diff1 or diff2:
-        graphite_data1 = get_value(diff1, seconds)
-        graphite_data2 = get_value(diff2, seconds)
-        graphite_data = abs(graphite_data1 - graphite_data2)
-    else:
-        graphite_data = get_value(url, seconds)
-
-    print 'Current value: %s, warn threshold: %s, crit threshold: %s' % \
-           (graphite_data, warn, crit)
-    if reverse == True:
-        if crit >= graphite_data:
-            sys.exit(STATE_CRITICAL)
-        elif warn >= graphite_data:
-            sys.exit(STATE_WARNING)
-        else:
-            sys.exit(STATE_OK)
-    else:
-        if graphite_data >= crit:
-            sys.exit(STATE_CRITICAL)
-        elif graphite_data >= warn:
-            sys.exit(STATE_WARNING)
-        else:
-            sys.exit(STATE_OK)
+    return mode(**vars(args))
 
 
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    exit_code = Nagios.UNKNOWN
+    try:
+        exit_code = main(sys.argv[1:])
+    except Exception, e:
+        traceback.print_exc()
+
+    sys.exit(exit_code)
